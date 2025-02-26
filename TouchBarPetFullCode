@@ -1,0 +1,554 @@
+import Cocoa
+
+// MARK: - GameView
+class GameView: NSView {
+    
+    // MARK: - IMAGES
+    
+    // Idle dog
+    let dogIdleImage  = NSImage(named: "BrownDachshund")
+    // Walking dog
+    let dogWalkImage  = NSImage(named: "BrownDachshundWalk")
+    
+    // 2-frame walk cycle (idle, walk)
+    var walkCycle: [NSImage] {
+        [dogIdleImage, dogWalkImage].compactMap { $0 }
+    }
+    
+    // 4 sleep frames: sleep1..sleep4
+    let sleepImages: [NSImage] = {
+        var frames = [NSImage]()
+        for i in 1...4 {
+            if let img = NSImage(named: "sleep\(i)") {
+                frames.append(img)
+            }
+        }
+        return frames
+    }()
+    
+    // Treat + Poop
+    let treatImage = NSImage(named: "treat")
+    let poopImage  = NSImage(named: "poop")
+    
+    // Cloud image (from assets)
+    let cloudImage = NSImage(named: "cloud")
+    
+    // Cloud constants and storage
+    let cloudSize = CGSize(width: 30, height: 20)  // 50% smaller than original
+    private struct Cloud {
+        var position: CGPoint
+        let speed: CGFloat
+    }
+    private var clouds: [Cloud] = []  // Marked as private
+    
+    // MARK: - DOG STATE
+    
+    var petPosition = CGPoint(x: 50, y: 2)
+    var petVelocity = CGVector(dx: 0, dy: 0)
+    
+    // Are we currently moving, or sleeping, or pausing after collision?
+    var isMoving           = false
+    var isSleeping         = false
+    var isInTreatCollision = false
+    
+    // Dimensions
+    let dogWidth:  CGFloat = 40
+    let dogHeight: CGFloat = 24
+    
+    // Timers
+    var actionTimer:    Timer?
+    var walkTimer:      Timer?
+    var sleepTimer:     Timer?
+    var collisionTimer: Timer?
+    
+    // Indices for animations
+    var walkFrameIndex  = 0  // 0 or 1
+    var sleepFrameIndex = 0  // cycles 0..1..2..3
+    
+    // MARK: - TREATS
+    
+    // Each treat is stored by its x,y position
+    var treats: [CGPoint] = []
+    let treatSize = CGSize(width: 24, height: 24)
+    
+    // Count how many treats have been eaten so far
+    var treatCollisionCount = 0
+    
+    // MARK: - POOP
+    
+    // Each poop’s position
+    var poops: [CGPoint] = []
+    let poopSize  = CGSize(width: 24, height: 24)
+    let poopScale = CGFloat(0.5) // draw at half-size
+    
+    // Helper to unify the poop bounding rect
+    private func poopRect(at pos: CGPoint) -> CGRect {
+        CGRect(x: pos.x,
+               y: pos.y,
+               width: poopSize.width * poopScale,
+               height: poopSize.height * poopScale)
+    }
+    
+    // MARK: - INIT
+    
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        self.wantsLayer = true
+        // Set the background color to pink instead of gray
+        self.layer?.backgroundColor = NSColor.systemCyan.cgColor
+        
+        // Immediately start random movement
+        scheduleNextPhase()
+    }
+    
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        self.wantsLayer = true
+        // Set the background color to pink instead of gray
+        self.layer?.backgroundColor = NSColor.systemPink.cgColor
+        
+        scheduleNextPhase()
+    }
+    
+    // MARK: - DRAWING
+    
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        
+        // 1) Draw clouds (behind the dog but in front of the background)
+        drawClouds()
+        
+        // 2) Draw poop (so dog appears on top)
+        drawAllPoops()
+        
+        // 3) Draw the dog
+        drawDog()
+        
+        // 4) Draw treats on top
+        drawAllTreats()
+    }
+    
+    private func drawClouds() {
+        guard let cloudImg = cloudImage else { return }
+        for cloud in clouds {
+            let rect = CGRect(origin: cloud.position, size: cloudSize)
+            cloudImg.draw(in: rect)
+        }
+    }
+    
+    private func drawAllPoops() {
+        guard let pImg = poopImage else { return }
+        for pos in poops {
+            pImg.draw(in: poopRect(at: pos))
+        }
+    }
+    
+    private func drawDog() {
+        // If collision pause => show "sleep4"
+        if isInTreatCollision, let collisionImg = NSImage(named: "sleep4") {
+            drawDogImage(collisionImg)
+            return
+        }
+        
+        // If sleeping => cycle sleep images
+        if isSleeping, !sleepImages.isEmpty {
+            let currentSleepFrame = sleepImages[sleepFrameIndex]
+            drawDogImage(currentSleepFrame)
+            return
+        }
+        
+        // If moving => 2-frame walk
+        if isMoving, walkFrameIndex < walkCycle.count {
+            let frame = walkCycle[walkFrameIndex]
+            drawDogImage(frame)
+            return
+        }
+        
+        // Otherwise => idle
+        if let idle = dogIdleImage {
+            drawDogImage(idle)
+        }
+    }
+    
+    private func drawAllTreats() {
+        guard let tImg = treatImage else { return }
+        for tPos in treats {
+            let rect = CGRect(origin: tPos, size: treatSize)
+            tImg.draw(in: rect)
+        }
+    }
+    
+    private func drawDogImage(_ image: NSImage) {
+        let dogRect = CGRect(x: petPosition.x,
+                             y: petPosition.y,
+                             width: dogWidth,
+                             height: dogHeight)
+        
+        guard let context = NSGraphicsContext.current?.cgContext else { return }
+        context.saveGState()
+        
+        // Flip horizontally if velocity is to the right
+        if petVelocity.dx > 0 {
+            let cx = dogRect.midX
+            let cy = dogRect.midY
+            context.translateBy(x: cx, y: cy)
+            context.scaleBy(x: -1, y: 1)
+            context.translateBy(x: -cx, y: -cy)
+        }
+        
+        image.draw(in: dogRect)
+        context.restoreGState()
+    }
+    
+    // MARK: - UPDATING (CALLED EVERY 0.1S)
+    
+    func updateGame() {
+        // Update clouds regardless of dog state
+        updateClouds()
+        
+        // If sleeping or collision, skip normal movement (but still update clouds)
+        if isSleeping || isInTreatCollision {
+            setNeedsDisplay(bounds)
+            return
+        }
+        
+        if isMoving {
+            // Move horizontally
+            petPosition.x += petVelocity.dx
+            bounceIfNeeded()
+        }
+        
+        // Check treat collisions
+        checkTreatCollisions()
+        
+        // Redraw the view
+        setNeedsDisplay(bounds)
+    }
+    
+    // MARK: - CLOUDS LOGIC
+    
+    private func updateClouds() {
+        // Move each cloud to the right by its speed
+        for i in 0..<clouds.count {
+            clouds[i].position.x += clouds[i].speed
+        }
+        // Remove clouds that have moved off the right edge
+        clouds.removeAll { $0.position.x > bounds.width }
+        
+        // Spawn a new cloud if there are none, or if the last one has moved sufficiently
+        if clouds.isEmpty || (clouds.last!.position.x > 100) {
+            spawnCloud()
+        }
+    }
+    
+    private func spawnCloud() {
+        // Spawn cloud from the left side at a random vertical position (within a chosen range)
+        // Note: With a view height of 40, we choose a y between 10 and 20.
+        let y = CGFloat.random(in: 10...20)
+        let newCloud = Cloud(position: CGPoint(x: -cloudSize.width, y: y), speed: 1.5)
+        clouds.append(newCloud)
+    }
+    
+    // MARK: - BOUNCE LOGIC
+    
+    private func bounceIfNeeded() {
+        if petPosition.x < 0 {
+            petPosition.x = 0
+            petVelocity.dx = abs(petVelocity.dx)
+        } else if petPosition.x > (bounds.width - dogWidth) {
+            petPosition.x = bounds.width - dogWidth
+            petVelocity.dx = -abs(petVelocity.dx)
+        }
+    }
+    
+    // MARK: - SPAWN TREAT
+    
+    func spawnTreat() {
+        // Place treat at a random x,y
+        guard treatImage != nil else { return }
+        
+        let randX = CGFloat.random(in: 0...(bounds.width  - treatSize.width))
+        let randY = CGFloat.random(in: 0...(bounds.height - treatSize.height))
+        
+        treats.append(CGPoint(x: randX, y: -10))
+        setNeedsDisplay(bounds)
+    }
+    
+    // MARK: - CLEAN ALL POOP
+    
+    func cleanAllPoops() {
+        poops.removeAll()
+        setNeedsDisplay(bounds)
+    }
+    
+    // MARK: - TREAT COLLISIONS
+    
+    private func checkTreatCollisions() {
+        let dogRect = CGRect(x: petPosition.x,
+                             y: petPosition.y,
+                             width: dogWidth,
+                             height: dogHeight)
+        
+        var collidedIndices: [Int] = []
+        for (i, treatPos) in treats.enumerated() {
+            let tRect = CGRect(origin: treatPos, size: treatSize)
+            if dogRect.intersects(tRect) {
+                collidedIndices.append(i)
+            }
+        }
+        
+        // Remove collided treats in descending order
+        for i in collidedIndices.sorted(by: >) {
+            treats.remove(at: i)
+            treatCollisionCount += 1
+        }
+        
+        if !collidedIndices.isEmpty {
+            handleTreatCollision()
+        }
+    }
+    
+    private func handleTreatCollision() {
+        // Pause for 1 second showing "sleep4"
+        actionTimer?.invalidate()
+        isMoving = false
+        petVelocity.dx = 0
+        stopWalkingAnimation()
+        
+        isInTreatCollision = true
+        
+        collisionTimer?.invalidate()
+        collisionTimer = Timer.scheduledTimer(withTimeInterval: 1.0,
+                                              repeats: false) { [weak self] _ in
+            guard let self = self else { return }
+            self.isInTreatCollision = false
+            self.scheduleNextPhase()
+        }
+        
+        // After 6 treats, spawn a poop
+        if treatCollisionCount >= 6 {
+            spawnPoop()
+            treatCollisionCount = 0
+        }
+    }
+    
+    private func spawnPoop() {
+        guard poopImage != nil else { return }
+        
+        // Calculate poop position based on dog's direction
+        let offset: CGFloat = 5
+        let behindX: CGFloat
+        if petVelocity.dx >= 0 {
+            behindX = petPosition.x - offset
+        } else {
+            behindX = petPosition.x + dogWidth + offset
+        }
+        let poopY = petPosition.y
+        
+        poops.append(CGPoint(x: behindX, y: poopY))
+        setNeedsDisplay(bounds)
+    }
+    
+    // MARK: - RANDOM MOVEMENT: SCHEDULE NEXT PHASE
+    
+    func scheduleNextPhase() {
+        // Skip if sleeping or during treat collision
+        if isSleeping || isInTreatCollision { return }
+        
+        if isMoving {
+            // If moving, then stop
+            stopWalkingAnimation()
+            isMoving = false
+            petVelocity.dx = 0
+            
+            let stopTime = Double.random(in: 1...5)
+            actionTimer = Timer.scheduledTimer(withTimeInterval: stopTime,
+                                               repeats: false) { [weak self] _ in
+                self?.scheduleNextPhase()
+            }
+        } else {
+            // If stopped, start moving
+            isMoving = true
+            startWalkingAnimation()
+            
+            let dir: CGFloat = Bool.random() ? 1 : -1
+            let speed = CGFloat.random(in: 1...2)
+            petVelocity.dx = dir * speed
+            
+            let moveTime = Double.random(in: 1...5)
+            actionTimer = Timer.scheduledTimer(withTimeInterval: moveTime,
+                                               repeats: false) { [weak self] _ in
+                self?.scheduleNextPhase()
+            }
+        }
+    }
+    
+    // MARK: - WALK ANIMATION (2 frames @ 5 FPS)
+    
+    func startWalkingAnimation() {
+        walkTimer?.invalidate()
+        walkTimer = nil
+        walkFrameIndex = 0
+        
+        walkTimer = Timer.scheduledTimer(withTimeInterval: 0.2,
+                                         repeats: true) { [weak self] _ in
+            self?.advanceWalkFrame()
+        }
+    }
+    
+    func stopWalkingAnimation() {
+        walkTimer?.invalidate()
+        walkTimer = nil
+        walkFrameIndex = 0
+    }
+    
+    private func advanceWalkFrame() {
+        walkFrameIndex = (walkFrameIndex + 1) % 2
+        setNeedsDisplay(bounds)
+    }
+    
+    // MARK: - SLEEP
+    
+    func goToSleep() {
+        // Cancel random movement
+        actionTimer?.invalidate()
+        actionTimer = nil
+        isMoving = false
+        petVelocity.dx = 0
+        stopWalkingAnimation()
+        
+        isSleeping = true
+        sleepFrameIndex = 0
+        
+        // 1 FPS sleep animation
+        guard !sleepImages.isEmpty else { return }
+        sleepTimer?.invalidate()
+        sleepTimer = Timer.scheduledTimer(withTimeInterval: 1.0,
+                                          repeats: true) { [weak self] _ in
+            self?.advanceSleepFrame()
+        }
+    }
+    
+    func wakeUp() {
+        sleepTimer?.invalidate()
+        sleepTimer = nil
+        isSleeping = false
+        sleepFrameIndex = 0
+        
+        // Resume random movement
+        scheduleNextPhase()
+    }
+    
+    private func advanceSleepFrame() {
+        sleepFrameIndex = (sleepFrameIndex + 1) % sleepImages.count
+        setNeedsDisplay(bounds)
+    }
+}
+
+// MARK: - ViewController
+class ViewController: NSViewController, NSTouchBarDelegate {
+    
+    private let gameView: GameView = {
+        let gv = GameView(frame: NSRect(x: 0, y: 0, width: 1000, height: 40))
+        return gv
+    }()
+    
+    private var gameTimer: Timer?
+    private var sleepWakeButton: NSButton?
+    
+    override func viewDidAppear() {
+        super.viewDidAppear()
+        
+        // Ensure the custom touch bar is used
+        self.view.window?.makeFirstResponder(self)
+        self.touchBar = makeTouchBar()
+        
+        // Start the main loop
+        startGameTimer()
+    }
+    
+    // Create an NSTouchBar with 4 items: gameItem, sleepButton, treatButton, cleanButton
+    override func makeTouchBar() -> NSTouchBar? {
+        let tb = NSTouchBar()
+        tb.delegate = self
+        tb.defaultItemIdentifiers = [.gameItem, .sleepButton, .treatButton, .cleanButton]
+        return tb
+    }
+    
+    func touchBar(_ touchBar: NSTouchBar,
+                  makeItemForIdentifier identifier: NSTouchBarItem.Identifier
+    ) -> NSTouchBarItem? {
+        
+        if identifier == .gameItem {
+            let item = NSCustomTouchBarItem(identifier: identifier)
+            item.view = gameView
+            return item
+            
+        } else if identifier == .sleepButton {
+            let item = NSCustomTouchBarItem(identifier: identifier)
+            let button = NSButton(title: "Sleep",
+                                  target: self,
+                                  action: #selector(toggleSleepWake))
+            item.view = button
+            sleepWakeButton = button
+            return item
+            
+        } else if identifier == .treatButton {
+            let item = NSCustomTouchBarItem(identifier: identifier)
+            let button = NSButton(title: "Treat",
+                                  target: self,
+                                  action: #selector(spawnTreat))
+            item.view = button
+            return item
+            
+        } else if identifier == .cleanButton {
+            let item = NSCustomTouchBarItem(identifier: identifier)
+            let button = NSButton(title: "Clean",
+                                  target: self,
+                                  action: #selector(cleanPoop))
+            item.view = button
+            return item
+        }
+        
+        return nil
+    }
+    
+    @objc func toggleSleepWake() {
+        if gameView.isSleeping {
+            // Wake up
+            gameView.wakeUp()
+            sleepWakeButton?.title = "Sleep"
+        } else {
+            // Sleep
+            gameView.goToSleep()
+            sleepWakeButton?.title = "Wake"
+        }
+    }
+    
+    @objc func spawnTreat() {
+        // Call the matching function in GameView
+        gameView.spawnTreat()
+    }
+    
+    @objc func cleanPoop() {
+        // Remove all poop piles
+        gameView.cleanAllPoops()
+    }
+    
+    private func startGameTimer() {
+        gameTimer?.invalidate()
+        // Update every 0.1s
+        gameTimer = Timer.scheduledTimer(withTimeInterval: 0.1,
+                                         repeats: true) { [weak self] _ in
+            self?.gameView.updateGame()
+        }
+    }
+}
+
+// MARK: - TouchBarItem Identifiers
+extension NSTouchBarItem.Identifier {
+    static let gameItem    = NSTouchBarItem.Identifier("com.example.TouchBarGame.gameItem")
+    static let sleepButton = NSTouchBarItem.Identifier("com.example.TouchBarGame.sleepButton")
+    static let treatButton = NSTouchBarItem.Identifier("com.example.TouchBarGame.treatButton")
+    static let cleanButton = NSTouchBarItem.Identifier("com.example.TouchBarGame.cleanButton")
+}
